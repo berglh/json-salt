@@ -1,0 +1,24 @@
+language: go
+go:
+  - 1.8
+env:
+  - "PATH=/home/travis/gopath/bin:$PATH"
+before_install:
+  - go get github.com/mitchellh/gox
+script:
+  - gox -osarch="linux/amd64 linux/386 darwin/amd64 darwin/386 windows/386 windows/amd64" -ldflags="-s -w" -output="build/{{.Dir}}-$TRAVIS_TAG-{{.OS}}-{{.Arch}}"
+  - mkdir dist && cd build
+  - wget -O - https://github.com/upx/upx/releases/download/v3.94/upx-3.94-amd64_linux.tar.xz | xz -d | tar -xv upx-3.94-amd64_linux/upx --strip-components=1 -C . 
+  - 'for i in $(ls json-salt-* | grep -v exe); do ./upx --brute $i; done'
+  - 'for i in *.exe; do cp $i json-salt.exe; zip ../dist/$(echo $i | sed -e "s/.exe//g").zip json-salt.exe; rm json-salt.exe; done'
+  - 'for i in $(ls json-salt-* | grep -v exe); do cp $i json-salt; tar -zcvf ../dist/$i.tar.gz json-salt; rm json-salt; done'
+  - cd ../
+  - ls -la dist/*
+deploy:
+  provider: releases
+  api-key: "$GITHUB_TOKEN"
+  file_glob: true
+  file: dist/*
+  skip_cleanup: true
+  on:
+    tags: true
