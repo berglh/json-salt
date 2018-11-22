@@ -32,6 +32,7 @@ type Job struct {
 // Options stores the config options for jobs
 type Options struct {
 	B      bool   // Brute forces hashes, no caching in map
+	U      bool   // Unsafe encoding reduces floats to 6 digits precision for faster encoding
 	LC     bool   // Transforms value to lowercase before hashing
 	UC     bool   // Transforms value to uppercase before hashing
 	WS     bool   // Removes trailing and leading whitespace before hashing
@@ -56,8 +57,9 @@ func main() {
 	k := flag.String("k", "", "The path to the key name to hash, separated by delimeter for nested keys")
 	s := flag.String("s", "", "Salt to hash the value with")
 	p := flag.Int("w", 1, "Number of concurrent processors")
+	u := flag.Bool("u", false, "Lossy JSON encoding increases speed but reduces floats to 6 digits precisionti")
 	lc := flag.Bool("lc", false, "Convert key value to lowercase before hashing")
-	b := flag.Bool("b", false, "Brute force just hashes every value and doesn't cache hashes to a map (typically faster)")
+	b := flag.Bool("b", false, "Brute force hashes every value and doesn't bother caching hashes to a map (typically faster)")
 	uc := flag.Bool("uc", false, "Convert key value to uppercase before hashing")
 	ws := flag.Bool("ws", false, "Strip trailing and leading whitespace on key value before hashing")
 	pretty := flag.Bool("p", false, "Pretty print the JSON output instead of JSON lines")
@@ -83,7 +85,7 @@ func main() {
 	keyParts := strings.Split(*k, *d)
 
 	// Capture options from flags
-	options := Options{LC: *lc, UC: *uc, WS: *ws, B: *b, File: *f, Output: *o, Pretty: *pretty}
+	options := Options{LC: *lc, UC: *uc, WS: *ws, B: *b, File: *f, Output: *o, Pretty: *pretty, U: *u}
 
 	// If the salt isn't provided by switch, read it in
 	if *s == "" {
@@ -109,15 +111,15 @@ func main() {
 	wg.Wait() // Wait until all routines have finished
 
 	// Close the channels
-	close(jobs)
 	close(out)
 
 }
 
+// produce reads the input file, decodes the json stream and submits jobs to the jobs channel
 func produce(jobs chan<- *Job, file string, keyParts []string) {
 
 	// Open file for steraming
-	jsonFile, err := os.Open(file) // Open up a file to read in bytes
+	jsonFile, err := os.Open(file)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error opening file: %s", err)
 		os.Exit(1)
@@ -130,17 +132,11 @@ func produce(jobs chan<- *Job, file string, keyParts []string) {
 	ID := 0                                                 // Set Job ID value
 
 	// Decoding loop
-	for {
+	for decoder.More() {
 		data := make(MapStr)         // Local map string interface required for job submission
 		err := decoder.Decode(&data) // Decode the next JSON document
 		if err != nil {
-			if err.Error() != "EOF" {
-				fmt.Fprintf(os.Stderr, "\nError decoding JSON: %s", err)
-				break
-			}
-			if err.Error() == "EOF" {
-				break
-			}
+			fmt.Fprintf(os.Stderr, "\nError decoding JSON: %s", err)
 		}
 		ID++                             // Incerement Job ID counter
 		jobs <- &Job{ID: ID, Work: data} // Submit a job to the jobs channel
@@ -150,19 +146,22 @@ func produce(jobs chan<- *Job, file string, keyParts []string) {
 		}
 	}
 
+	// Finalise producer function
 	fmt.Fprintf(os.Stderr, "\rTotal JSON docs: %d", ID) // Print the totals after parsing the file
+	close(jobs)
 
 }
 
+// consume pulls the decoded JSON payloads, hashes the desired value
+// encodes the payload and sends it to the output channel
 func consume(id int, jobs <-chan *Job, out chan<- string, keyParts []string, hashmap sync.Map, options Options) {
 
 	defer wg.Done() // Keep the WaitGroup open
 
 	for job := range jobs {
 
-		var hash interface{}              // Interface for storing md5 hash
-		var json = jsoniter.ConfigFastest // Use jsoniter instead of encoding/json
-		var ok bool                       // Conditional bool that gets reused in the loop
+		var hash interface{} // Interface for storing md5 hash
+		var ok bool          // Conditional bool that gets reused in the loop
 
 		value, err := getValue(keyParts, job.Work) // Get the value of the supplied key
 		if err != nil {
@@ -181,11 +180,10 @@ func consume(id int, jobs <-chan *Job, out chan<- string, keyParts []string, has
 			}
 		}
 
+		// If brute force mode is not selected, use a sync.Map for caching hashes
 		if options.B == false {
-
 			// Lock the hashmap for reading
 			hash, ok = hashmap.Load(value)
-
 			if !ok {
 				h := md5.New()                          // Create a new md5 object
 				io.WriteString(h, string(options.Salt)) // Add some salt
@@ -193,8 +191,7 @@ func consume(id int, jobs <-chan *Job, out chan<- string, keyParts []string, has
 				hash = hex.EncodeToString(h.Sum(nil))   // get the has
 				hashmap.Store(value.(string), hash)     // Capture the hash to the cache map
 			}
-
-		} else {
+		} else { // Otherwise calulate every md5sum
 			h := md5.New()                          // Create a new md5 object
 			io.WriteString(h, string(options.Salt)) // Add some salt
 			io.WriteString(h, value.(string))       // Garnish with value
@@ -208,19 +205,37 @@ func consume(id int, jobs <-chan *Job, out chan<- string, keyParts []string, has
 
 		// Encode for output
 		if options.Pretty == false {
-			// Encode JSON lines
-			dataout, _ := json.MarshalToString(job.Work)
-			out <- dataout // Submit encoded object to the out channel
+			if options.U == false {
+				json := jsoniter.ConfigCompatibleWithStandardLibrary
+				// Encode JSON lines
+				dataout, _ := json.MarshalToString(job.Work)
+				out <- dataout // Submit encoded object to the out channel
+			} else {
+				json := jsoniter.ConfigFastest // Use jsoniter instead of encoding/json
+				// Encode JSON lines
+				dataout, _ := json.MarshalToString(job.Work)
+				out <- dataout // Submit encoded object to the out channel
+			}
+
 		} else {
-			// Endcode pretty JSON
-			dataout, _ := json.MarshalIndent(job.Work, "", "    ")
-			out <- string(dataout) // Submit encoded object to the out channel
+			if options.U == false {
+				json := jsoniter.ConfigCompatibleWithStandardLibrary
+				// Endcode pretty JSON
+				dataout, _ := json.MarshalIndent(job.Work, "", "    ")
+				out <- string(dataout) // Submit encoded object to the out channel
+			} else {
+				json := jsoniter.ConfigFastest // Use jsoniter instead of encoding/json
+				// Endcode pretty JSON
+				dataout, _ := json.MarshalIndent(job.Work, "", "    ")
+				out <- string(dataout) // Submit encoded object to the out channel
+			}
 		}
 
 	}
 
 }
 
+// ouput routine consumes the out channel and writes the encoded payload to the chose output method
 func output(out <-chan string, options Options) {
 
 	// Direct encoded object to output file or stdout
